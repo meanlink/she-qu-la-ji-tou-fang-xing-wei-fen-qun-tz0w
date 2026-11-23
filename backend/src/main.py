@@ -15,7 +15,7 @@ from scripts.seed_demo import seed
 from src.contracts import Delivery, Login, Note, RegisterPoint, Relocation, Role, RunRequest, Window
 from src.fieldwork import add_point, add_window, propose_move, resolve_move
 from src.outreach import deliver, review_retest
-from src import quality, workflow_schema
+from src import offline_sync, quality, workflow_schema
 from src.workflow_routes import router as workflow_router
 from src.runs import confirm_run, get_run, queue_run
 from src.security import allow, login, signed_in
@@ -40,6 +40,7 @@ async def lifespan(app):
 app = FastAPI(title='栖梧社区投放手册', lifespan=lifespan)
 app.include_router(quality.router)
 app.include_router(workflow_router)
+app.include_router(offline_sync.router)
 field_staff = allow(Role.ANALYST, Role.ADMIN)
 operations = allow(Role.ADMIN)
 
@@ -135,8 +136,10 @@ def clear_move(point_id: int, form: Note, staff=Depends(operations)):
 @app.get('/windows')
 def windows(staff=Depends(signed_in)):
     with register() as ledger:
-        return ledger.rows('''SELECT w.*,p.code,p.name AS point_name,p.revision AS current_revision
+        return ledger.rows('''SELECT w.*,p.code,p.name AS point_name,p.revision AS current_revision,
+            b.id AS backfill_id,b.state AS backfill_state
             FROM sampling_windows w JOIN disposal_points p ON p.id=w.point_id
+            LEFT JOIN offline_backfills b ON b.window_id=w.id
             ORDER BY w.sample_day DESC,w.id DESC LIMIT 250''')
 
 

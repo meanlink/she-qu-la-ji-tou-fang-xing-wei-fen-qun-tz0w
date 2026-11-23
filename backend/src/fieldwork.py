@@ -72,6 +72,14 @@ def current_point(point, revision):
         raise HTTPException(409, '点位迁移待核或地址版本已改变')
 
 
+def insert_window(ledger, *, point_id, point_revision, sample_day, slot, total, correct, overflow, task_id, entered_by):
+    """Write one aggregate window; callers own prior validation and duplicate checks."""
+    return ledger.execute('''INSERT INTO sampling_windows
+        (point_id,point_revision,sample_day,slot,total,correct,overflow,task_id,entered_by)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
+        (point_id, point_revision, sample_day, slot, total, correct, overflow, task_id, entered_by))
+
+
 def add_window(form, actor):
     with register(write=True) as ledger:
         point = get_point(ledger, form.point_id)
@@ -89,9 +97,10 @@ def add_window(form, actor):
         if ledger.one('''SELECT id FROM sampling_windows WHERE point_id=%s AND point_revision=%s
                       AND sample_day=%s AND slot=%s''', key):
             raise HTTPException(409, '同一地址版本、日期和时段只能入账一次')
-        window_id = ledger.execute('''INSERT INTO sampling_windows
-            (point_id,point_revision,sample_day,slot,total,correct,overflow,task_id,entered_by)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)''', (*key, form.total, form.correct, form.overflow, form.task_id, actor))
+        window_id = insert_window(ledger, point_id=form.point_id, point_revision=point['revision'],
+                                  sample_day=form.sample_day, slot=form.slot, total=form.total,
+                                  correct=form.correct, overflow=form.overflow, task_id=form.task_id,
+                                  entered_by=actor)
         ledger.audit(actor, 'retest_window_recorded' if form.task_id else 'baseline_window_recorded', window_id,
                      form.model_dump(mode='json'))
         return {'id': window_id, 'point_revision': point['revision'], **form.model_dump()}

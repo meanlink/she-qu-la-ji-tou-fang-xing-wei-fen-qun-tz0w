@@ -1,6 +1,7 @@
 import {api, session} from './api.js';
-import {roles, state} from './state.js';
+import {labels, pointById, roles, state} from './state.js';
 import {empty, formError, text} from './ui.js';
+import {cachedPoints, enqueue, hasQueued, isOffline, rememberPoints, syncQueued} from './offline-queue.js';
 import {pointsPage} from './pages/points.js';
 import {windowsPage} from './pages/windows.js';
 import {groupsPage} from './pages/groups.js';
@@ -26,6 +27,7 @@ const pages = {
 let generation = 0;
 let poll;
 let noticeTimer;
+const cached = new Map();
 
 function current() {
   const [key, query] = location.hash.slice(1).split('?');
@@ -70,8 +72,9 @@ async function refresh() {
     if (pages[key].load) data = {[key]: await pages[key].load(params)};
     if (key === 'points') data = {points: await api.points()};
     if (key === 'windows') {
-      const [points, windows, tasks] = await Promise.all([api.points(), api.windows(), params.has('task') ? api.tasks() : []]);
-      data = {points, windows, tasks};
+      const [points, windows, tasks, backfills] = await Promise.all([
+        api.points(), api.windows(), params.has('task') ? api.tasks() : [], api.backfills()]);
+      data = {points, windows, tasks, backfills};
     }
     if (key === 'groups') {
       const [runs, windows] = await Promise.all([api.runs(), api.windows()]);
@@ -83,15 +86,39 @@ async function refresh() {
     if (key === 'overflow') data = {overflowDispatch: await api.overflowDispatch()};
     if (token !== generation) return;
     Object.assign(state, data);
-    shell(key, pages[key].render(params));
+    if (data.points) rememberPoints(data.points);
+    const body = pages[key].render(params);
+    cached.set(key, {data, params});
+    shell(key, body);
     if (key === 'groups' && data.run?.state === 'queued') poll = setTimeout(refresh, 1200);
   } catch (error) {
     if (token !== generation) return;
-    if (error.status === 401) logout();
-    else shell(key, `${empty(error.message)}<button type="button" id="retry">重新加载</button>`);
+    if (error.status === 401) { logout(); return; }
+    if (isOffline() || error.name === 'TypeError') {
+      // Fall back to the last loaded data so anonymous counts can still be recorded offline.
+      const last = cached.get(key);
+      if (state.staff && key === 'windows' && state.points.length) shell(key, windowsPage(params));
+      else if (state.staff && last) { Object.assign(state, last.data); shell(key, pages[key].render(last.params)); }
+      else shell(key, `${empty('无网络，暂无缓存数据。联网后可继续录入。')}<button type="button" id="retry">重新加载</button>`);
+      return;
+    }
+    shell(key, `${empty(error.message)}<button type="button" id="retry">重新加载</button>`);
   }
 }
 
+async function flushQueue() {
+  if (!state.staff || isOffline() || !hasQueued(state.staff.username)) return;
+  const token = generation;
+  try {
+    const result = await syncQueued(state.staff.username, api.syncBackfill);
+    if (token !== generation) return;
+    const pending = result.summary?.pending ?? 0;
+    announce(`已补传 ${result.synced} 条记录${pending ? `，${pending} 条待运营裁定` : ''}`);
+    await refresh();
+  } catch {
+    announce('补传未完成，记录仍暂存本机，可稍后重试');
+  }
+}
 function logout() {
   session.token = null;
   state.staff = null;
@@ -104,6 +131,7 @@ async function change(form, fields, submitter) {
     case 'login': {
       const result = await api.login(fields);
       session.token = result.access_token;
+      session.staff = result.staff;
       state.staff = result.staff;
       return {};
     }
@@ -120,8 +148,35 @@ async function change(form, fields, submitter) {
     case 'window':
       for (const key of ['point_id', 'total', 'correct', 'overflow']) fields[key] = Number(fields[key]);
       if (form.dataset.task) fields.task_id = Number(form.dataset.task);
-      await api.addWindow(fields);
+      {
+        const label = `${pointById(fields.point_id)?.code ?? `点位 #${fields.point_id}`} · ${fields.sample_day} · ${labels[fields.slot] ?? fields.slot}`;
+        const stash = note => {
+          const count = enqueue(state.staff.username,
+            {...fields, point_revision: Number(pointById(fields.point_id)?.revision ?? 1)}, label);
+          return {message: `${note}，已暂存 ${count} 条离线观察，联网后整批补传`};
+        };
+        if (isOffline()) return stash('无网络');
+        try {
+          await api.addWindow(fields);
+        } catch (error) {
+          if (error.name !== 'TypeError') throw error;
+          return stash('与服务器连接中断');
+        }
+      }
       return {message: fields.task_id ? '复测窗口已入账' : '基线窗口已入账'};
+    case 'sync-backfill': {
+      try {
+        const result = await syncQueued(state.staff.username, api.syncBackfill);
+        const pending = result.summary?.pending ?? 0;
+        return {message: `已补传 ${result.synced} 条记录${pending ? `，${pending} 条待运营裁定` : ''}`};
+      } catch (error) {
+        if (error.name !== 'TypeError') throw error;
+        throw new Error('补传未完成，记录仍暂存本机，可稍后重试');
+      }
+    }
+    case 'resolve-backfill':
+      await api.resolveBackfill(id, fields);
+      return {message: fields.decision === 'apply' ? '补传记录已补入原班次' : '补传记录已退回'};
     case 'run': {
       const run = await api.requestRun({...fields, clusters: Number(fields.clusters)});
       return {location: `#groups?run=${run.id}`, message: run.state === 'paused' ? '分群暂停，请查看原因' : '已收到分群请求'};
@@ -161,16 +216,18 @@ app.addEventListener('submit', async event => {
   const fields = Object.fromEntries(new FormData(form));
   const errorNode = form.querySelector('.form-error');
   const buttons = [...form.querySelectorAll('button')];
-  errorNode.hidden = true;
+  if (errorNode) errorNode.hidden = true;
   buttons.forEach(button => { button.disabled = true; });
   try {
     const result = await change(form, fields, event.submitter);
     if (result.message) announce(result.message);
     if (result.location && location.hash !== result.location) location.hash = result.location;
     else await refresh();
+    if (form.dataset.action === 'login') flushQueue();
   } catch (error) {
     if (error.status === 401 && form.dataset.action !== 'login') logout();
-    else { errorNode.textContent = error.message; errorNode.hidden = false; }
+    else if (errorNode) { errorNode.textContent = error.message; errorNode.hidden = false; }
+    else announce(error.message);
   } finally {
     buttons.forEach(button => { button.disabled = false; });
   }
@@ -180,8 +237,21 @@ app.addEventListener('click', event => {
   if (event.target.id === 'retry') refresh();
 });
 window.addEventListener('hashchange', refresh);
+window.addEventListener('online', () => {
+  if (state.staff && hasQueued(state.staff.username)) { announce('网络已恢复，开始补传离线记录'); flushQueue(); }
+});
+window.addEventListener('offline', () => announce('网络已断开，之后的匿名观察会暂存本机'));
 if (session.token) {
   try { state.staff = await api.session(); }
-  catch { session.token = null; }
+  catch (error) {
+    // A dropped connection mid-shift must not sign the inspector out; use the cached identity.
+    if (error.status === 401) session.token = null;
+    else state.staff = session.staff;
+  }
+}
+if (!state.points.length) {
+  state.points = cachedPoints();
+  cached.set('points', {data: {points: state.points}, params: new URLSearchParams()});
 }
 await refresh();
+await flushQueue();

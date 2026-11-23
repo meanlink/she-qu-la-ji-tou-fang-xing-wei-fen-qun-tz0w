@@ -1,4 +1,5 @@
-export const state = {staff: null, points: [], windows: [], runs: [], run: null, tasks: []};
+export const state = {staff: null, points: [], windows: [], runs: [], run: null, tasks: [],
+  backfills: {records: [], reasons: {}}};
 export const pointById = id => state.points.find(point => point.id === Number(id));
 export const taskById = id => state.tasks.find(task => task.id === Number(id));
 export const canEdit = () => ['admin', 'analyst'].includes(state.staff.role);

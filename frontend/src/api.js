@@ -4,7 +4,14 @@ export const session = {
   get token() { return sessionStorage.getItem('qiwu-field-token'); },
   set token(value) {
     if (value) sessionStorage.setItem('qiwu-field-token', value);
-    else sessionStorage.removeItem('qiwu-field-token');
+    else { sessionStorage.removeItem('qiwu-field-token'); sessionStorage.removeItem('qiwu-field-staff'); }
+  },
+  get staff() {
+    try { return JSON.parse(sessionStorage.getItem('qiwu-field-staff')); } catch { return null; }
+  },
+  set staff(value) {
+    if (value) sessionStorage.setItem('qiwu-field-staff', JSON.stringify(value));
+    else sessionStorage.removeItem('qiwu-field-staff');
   },
 };
 
@@ -40,6 +47,9 @@ export const api = {
   move: (id, data) => call(`/points/${id}/relocation`, data),
   resolve: (id, action, data) => call(`/points/${id}/relocation/${action}`, data),
   windows: () => call('/windows'), addWindow: data => call('/windows', data),
+  backfills: () => call('/offline-backfills'),
+  syncBackfill: data => call('/offline-backfills', data),
+  resolveBackfill: (id, data) => call(`/offline-backfills/${id}/resolve`, data),
   runs: () => call('/runs'), run: id => call(`/runs/${id}`), requestRun: data => call('/runs', data),
   confirm: (id, data) => call(`/runs/${id}/confirm`, data),
   tasks: () => call('/tasks'), deliver: (id, data) => call(`/tasks/${id}/delivery`, data),
